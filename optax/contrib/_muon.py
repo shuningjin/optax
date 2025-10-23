@@ -122,12 +122,22 @@ def _shape_factor(x: jax.Array, dim_nums: MuonDimensionNumbers) -> float:
       x.shape[ax] for ax in reduction_axes)
 
 
+def _shape_factor_consistent_rms(
+    x: jax.Array, dim_nums: MuonDimensionNumbers
+) -> float:
+  reduction_axes, output_axes = _normalize_axes(x, dim_nums)
+  return max(
+      math.prod(x.shape[ax] for ax in output_axes),
+      math.prod(x.shape[ax] for ax in reduction_axes),
+  )
+
+
 def _newton_schulz_iterator(x: jax.Array, coeffs: jax.Array) -> jax.Array:
   # Implements Newton-Schulz step f(X) = c_0 X + c_1 (XX^T)X + c_2 (XX^T)^2X,
   # with quintic form f(X) = c_0 X + (c_1 A + c_2 AA)X, where A = XX^T.
   # The NS step has the property f(X) = f(X^T)^T. That is, we can get equivalent
-  # result by tranposing input and output. In particular, we may tranpose X
-  # when rows > cols for effciency.
+  # result by transposing input and output. In particular, we may transpose X
+  # when rows > cols for efficiency.
   a = x @ x.T
   b = coeffs[1] * a + coeffs[2] * a @ a
   return coeffs[0] * x + b @ x
@@ -218,6 +228,7 @@ def scale_by_muon(
     nesterov: bool = True,
     adaptive: bool = False,
     weight_dimension_numbers: WeightDimNumOrFn | None = None,
+    consistent_rms: float | None = None,
 ) -> base.GradientTransformation:
   r"""Rescale updates according to the Muon algorithm.
 
@@ -239,8 +250,13 @@ def scale_by_muon(
       original updates. See <https://arxiv.org/abs/2409.20325>
     weight_dimension_numbers: An optional tree with the same structure as the
       params of `MuonDimensionNumbers`s, specifying how to reshape the
-      parameters before and after the orthogonalization OR a callble returning
+      parameters before and after the orthogonalization OR a callable returning
       such a tree. None implies that all parameters are 2D matrices.
+    consistent_rms: An optional float to activate consistent RMS scaling.
+      Scales updates by `sqrt(max(fan_in, fan_out)) * consistent_rms`
+      to make RMS shape-independent, like AdamW. A value of `0.2` is
+      recommended to match AdamW's empirical RMS. See <https://arxiv.org/abs/2402.16982>.
+      If `None` (default), uses original MuP scaling: `sqrt(max(1, fan_out/fan_in))`.
 
   Returns:
     A `GradientTransformation` object.
@@ -300,12 +316,33 @@ def scale_by_muon(
       updates = jax.tree.map(
           lambda x, y: jnp.sum(x * y) * y, mu_hat, updates
       )
-    factors = jax.tree.map(_shape_factor, updates, resolved_weight_dim_nums,
-                           is_leaf=_is_weight_dim_nums)
-    updates = jax.tree.map(
-        lambda x, factor: jnp.sqrt(jnp.maximum(1, factor)) * x,
-        updates, factors
-    )
+
+    if consistent_rms is not None:
+      assert consistent_rms > 0
+      factors = jax.tree.map(
+          _shape_factor_consistent_rms,
+          updates,
+          resolved_weight_dim_nums,
+          is_leaf=_is_weight_dim_nums,
+      )
+      updates = jax.tree.map(
+          lambda x, factor: jnp.sqrt(factor) * consistent_rms * x,
+          updates,
+          factors,
+      )
+    else:
+      factors = jax.tree.map(
+          _shape_factor,
+          updates,
+          resolved_weight_dim_nums,
+          is_leaf=_is_weight_dim_nums,
+      )
+      updates = jax.tree.map(
+          lambda x, factor: jnp.sqrt(jnp.maximum(1, factor)) * x,
+          updates,
+          factors,
+      )
+
     mu = optax.tree.cast(mu, mu_dtype)
     return updates, MuonState(
         count=count_inc,
@@ -337,6 +374,7 @@ def muon(
     adam_eps_root: float = 0.0,
     adam_weight_decay: float = 0.0,
     muon_weight_dimension_numbers: WeightDimNumOrFn | None = None,
+    consistent_rms: float | None = None,
 ) -> base.GradientTransformation:
   r"""Muon: Momentum Orthogonalized by Newton-schulz.
 
@@ -382,6 +420,11 @@ def muon(
       Adam. A callable takes as input the params and returns a possibly masked
       pytree of specs, similar to `weight_decay_mask`. If not provided, muon is
       applied to all 2D parameters.
+    consistent_rms: An optional float to activate consistent RMS scaling.
+      Scales updates by `sqrt(max(fan_in, fan_out)) * consistent_rms` to make
+      root mean square (RMS) shape-independent, like AdamW. A value of `0.2` is
+      recommended to match AdamW's empirical RMS. See <https://arxiv.org/abs/2402.16982>.
+      If `None` (default), uses original MuP scaling: `sqrt(max(1, fan_out/fan_in))`.
 
   Returns:
     The corresponding `GradientTransformation`.
@@ -439,6 +482,7 @@ def muon(
                   nesterov=nesterov,
                   adaptive=adaptive,
                   weight_dimension_numbers=muon_weight_dim_nums_fn,
+                  consistent_rms=consistent_rms,
               ),
               transform.add_decayed_weights(weight_decay, weight_decay_mask),
               transform.scale_by_learning_rate(learning_rate),
