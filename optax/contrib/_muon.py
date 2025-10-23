@@ -21,6 +21,7 @@ by Keller Jordan
 
 
 import math
+from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Union, Sequence
 
 import chex
@@ -116,20 +117,29 @@ def _compute_muon_reshape(x: jax.Array, dim_nums: MuonDimensionNumbers
   return reshape_fn, inverse_fn
 
 
-def _shape_factor(x: jax.Array, dim_nums: MuonDimensionNumbers) -> float:
-  reduction_axes, output_axes = _normalize_axes(x, dim_nums)
-  return math.prod(x.shape[ax] for ax in output_axes) / math.prod(
-      x.shape[ax] for ax in reduction_axes)
-
-
-def _shape_factor_consistent_rms(
+def _get_shape_products(
     x: jax.Array, dim_nums: MuonDimensionNumbers
-) -> float:
+) -> tuple[float, float]:
   reduction_axes, output_axes = _normalize_axes(x, dim_nums)
-  return max(
-      math.prod(x.shape[ax] for ax in output_axes),
-      math.prod(x.shape[ax] for ax in reduction_axes),
-  )
+  fan_in = math.prod(x.shape[ax] for ax in reduction_axes)
+  fan_out = math.prod(x.shape[ax] for ax in output_axes)
+  return fan_in, fan_out
+
+
+def _scale_update_with_mup(update: jax.Array, dim_nums: MuonDimensionNumbers):
+  fan_in, fan_out = _get_shape_products(update, dim_nums)
+  factor = fan_out / fan_in
+  scale = jnp.sqrt(jnp.maximum(1.0, factor))
+  return scale * update
+
+
+def _scale_update_with_consistent_rms(
+    update: jax.Array, dim_nums: MuonDimensionNumbers, consistent_rms: float
+):
+  fan_in, fan_out = _get_shape_products(update, dim_nums)
+  factor = max(fan_out, fan_in)
+  scale = jnp.sqrt(factor) * consistent_rms
+  return scale * update
 
 
 def _newton_schulz_iterator(x: jax.Array, coeffs: jax.Array) -> jax.Array:
@@ -318,30 +328,18 @@ def scale_by_muon(
       )
 
     if consistent_rms is not None:
-      assert consistent_rms > 0
-      factors = jax.tree.map(
-          _shape_factor_consistent_rms,
-          updates,
-          resolved_weight_dim_nums,
-          is_leaf=_is_weight_dim_nums,
-      )
-      updates = jax.tree.map(
-          lambda x, factor: jnp.sqrt(factor) * consistent_rms * x,
-          updates,
-          factors,
+      scaling_fn = partial(
+          _scale_update_with_consistent_rms, consistent_rms=consistent_rms
       )
     else:
-      factors = jax.tree.map(
-          _shape_factor,
-          updates,
-          resolved_weight_dim_nums,
-          is_leaf=_is_weight_dim_nums,
-      )
-      updates = jax.tree.map(
-          lambda x, factor: jnp.sqrt(jnp.maximum(1, factor)) * x,
-          updates,
-          factors,
-      )
+      scaling_fn = _scale_update_with_mup
+
+    updates = jax.tree.map(
+        scaling_fn,
+        updates,
+        resolved_weight_dim_nums,
+        is_leaf=_is_weight_dim_nums,
+    )
 
     mu = optax.tree.cast(mu, mu_dtype)
     return updates, MuonState(
