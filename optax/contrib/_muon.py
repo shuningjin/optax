@@ -128,8 +128,7 @@ def _get_shape_products(
 
 def _scale_update_with_mup(update: jax.Array, dim_nums: MuonDimensionNumbers):
   fan_in, fan_out = _get_shape_products(update, dim_nums)
-  factor = fan_out / fan_in
-  scale = jnp.sqrt(jnp.maximum(1.0, factor))
+  scale = jnp.sqrt(jnp.maximum(1, fan_out / fan_in))
   return scale * update
 
 
@@ -137,8 +136,7 @@ def _scale_update_with_consistent_rms(
     update: jax.Array, dim_nums: MuonDimensionNumbers, consistent_rms: float
 ):
   fan_in, fan_out = _get_shape_products(update, dim_nums)
-  factor = max(fan_out, fan_in)
-  scale = jnp.sqrt(factor) * consistent_rms
+  scale = jnp.sqrt(jnp.maximum(fan_in, fan_out)) * consistent_rms
   return scale * update
 
 
@@ -422,7 +420,7 @@ def muon(
       Scales updates by `sqrt(max(fan_in, fan_out)) * consistent_rms` to make
       root mean square (RMS) shape-independent, like AdamW. A value of `0.2` is
       recommended to match AdamW's empirical RMS. See <https://arxiv.org/abs/2402.16982>.
-      If `None` (default), uses original MuP scaling: `sqrt(max(1, fan_out/fan_in))`.
+      If `None` (default), uses original MuP scaling: `sqrt(max(1, fan_out / fan_in))`.
 
   Returns:
     The corresponding `GradientTransformation`.
